@@ -1,0 +1,2 @@
+[console_scripts]
+mariadb-to-oracle = mariadb_to_oracle.cli:main

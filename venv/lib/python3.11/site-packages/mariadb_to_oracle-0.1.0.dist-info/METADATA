@@ -1,0 +1,63 @@
+Metadata-Version: 2.4
+Name: mariadb-to-oracle
+Version: 0.1.0
+Summary: Convertisseur de base de données SQLite/MariaDB vers Oracle
+Home-page: https://github.com/votre-repo/mariadb-to-oracle
+Author: MATILDA
+Author-email: votre@email.com
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown
+Requires-Dist: oracledb>=1.0.0
+Requires-Dist: sqlalchemy>=1.4.0
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+# MariaDB/SQLite to Oracle Converter
+
+Outil de conversion de bases de données SQLite vers Oracle SQL.
+
+## Installation
+
+```bash
+pip install mariadb-to-oracle
+```
+
+## Utilisation
+
+```bash
+# Utilisation en ligne de commande
+mariadb-to-oracle --sqlite_db path/to/your_database.sqlite
+
+# Options supplémentaires
+mariadb-to-oracle --sqlite_db path/to/your_database.sqlite --username custom_user --password custom_pass --drop-tables --force-recreate
+```
+
+## Fonctionnalités
+
+- Convertit les schémas et données SQLite en Oracle SQL compatible
+- Crée automatiquement un utilisateur Oracle
+- Exécute le script SQL généré dans Oracle
+- Fournit l'URI SQLAlchemy pour se connecter à la base créée
+
+## Configuration Oracle
+
+La configuration par défaut pour Oracle est la suivante:
+```python
+ORACLE_CONFIG = {
+    "user": "system",
+    "password": "YourPassword",
+    "dsn": "localhost:1521/free"
+}
+```
+
+Vous pouvez modifier ces paramètres dans le code ou passer des arguments en ligne de commande.

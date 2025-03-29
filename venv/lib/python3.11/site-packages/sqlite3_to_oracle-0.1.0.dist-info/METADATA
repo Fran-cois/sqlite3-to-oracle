@@ -1,0 +1,126 @@
+Metadata-Version: 2.4
+Name: sqlite3-to-oracle
+Version: 0.1.0
+Summary: Convertisseur de base de données SQLite vers Oracle
+Home-page: https://github.com/votre-repo/sqlite3-to-oracle
+Author: MATILDA
+Author-email: votre@email.com
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown
+Requires-Dist: oracledb>=1.0.0
+Requires-Dist: sqlalchemy>=1.4.0
+Requires-Dist: python-dotenv>=0.19.0
+Requires-Dist: rich>=12.0.0
+Requires-Dist: pyperclip>=1.8.0
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+# SQLite to Oracle Converter
+
+Outil de conversion de bases de données SQLite vers Oracle SQL.
+
+## Installation
+
+```bash
+pip install sqlite3-to-oracle
+```
+
+## Utilisation
+
+```bash
+# Utilisation en ligne de commande
+sqlite3-to-oracle --sqlite_db path/to/your_database.sqlite
+
+# Options supplémentaires
+sqlite3-to-oracle --sqlite_db path/to/your_database.sqlite --new-username custom_user --new-password custom_pass --drop-tables --force-recreate
+
+# Utilisation avec un fichier .env
+sqlite3-to-oracle --env-file /path/to/.env
+```
+
+## Fichier .env
+
+Vous pouvez configurer toutes les options dans un fichier .env :
+
+```env
+# Configuration Oracle Admin
+ORACLE_ADMIN_USER=system
+ORACLE_ADMIN_PASSWORD=password
+ORACLE_ADMIN_DSN=localhost:1521/free
+
+# Options du programme
+ORACLE_SQLITE_DB=/path/to/database.sqlite
+ORACLE_OUTPUT_FILE=/path/to/output.sql
+ORACLE_NEW_USERNAME=new_user
+ORACLE_NEW_PASSWORD=new_pass
+ORACLE_DROP_TABLES=true
+ORACLE_FORCE_RECREATE=true
+ORACLE_SCHEMA_ONLY=false
+```
+
+## Fonctionnalités
+
+- Convertit les schémas et données SQLite en Oracle SQL compatible
+- Crée automatiquement un utilisateur Oracle
+- Exécute le script SQL généré dans Oracle
+- Fournit l'URI SQLAlchemy pour se connecter à la base créée
+
+## Configuration Oracle
+
+Plusieurs méthodes sont disponibles pour configurer l'accès à Oracle :
+
+1. **Variables d'environnement** :
+   - ORACLE_ADMIN_USER, ORACLE_ADMIN_PASSWORD, ORACLE_ADMIN_DSN
+
+2. **Fichier .env** :
+   - Utiliser l'option --env-file pour spécifier le chemin du fichier
+
+3. **Fichier de configuration JSON** :
+   - ~/.oracle_config.json (automatique)
+   - Ou spécifier avec --oracle-config-file
+
+4. **Arguments en ligne de commande** :
+   - --oracle-admin-user, --oracle-admin-password, --oracle-admin-dsn
+
+Les paramètres de ligne de commande ont la priorité sur les autres méthodes.
+
+## Vérifications post-importation
+
+Après avoir importé votre base de données SQLite vers Oracle, l'outil valide automatiquement l'importation pour s'assurer que les tables, colonnes et données ont été correctement transférées.
+
+```bash
+# La validation est activée par défaut, donc cette commande effectue déjà une validation
+sqlite3-to-oracle --sqlite_db path/to/your_database.sqlite
+
+# Pour désactiver la validation (non recommandé)
+sqlite3-to-oracle --sqlite_db path/to/your_database.sqlite --no-validate-schema
+
+# Pour des détails supplémentaires sur les éventuels problèmes
+sqlite3-to-oracle --sqlite_db path/to/your_database.sqlite --verbose
+```
+
+### Vérifications effectuées
+
+La validation post-importation vérifie :
+
+1. **Tables** : Toutes les tables SQLite sont présentes dans Oracle
+2. **Schéma** : Les colonnes et leurs types de données correspondent entre SQLite et Oracle  
+3. **Données** : Le nombre d'enregistrements dans chaque table correspond entre les deux bases
+4. **Récapitulatif** : Un résumé statistique avec le total des tables, colonnes et lignes
+
+### Interpréter les résultats
+
+- ✅ **VALIDATION RÉUSSIE** : Toutes les tables, colonnes et données ont été correctement importées
+- ⚠️ **VALIDATION AVEC AVERTISSEMENTS** : L'importation est partiellement réussie mais présente des problèmes
+  
+Utilisez l'option `--verbose` pour voir les détails spécifiques des avertissements et des erreurs, comme les tables ou colonnes manquantes.

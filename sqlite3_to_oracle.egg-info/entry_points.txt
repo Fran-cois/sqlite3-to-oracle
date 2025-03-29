@@ -1,0 +1,2 @@
+[console_scripts]
+sqlite3-to-oracle = sqlite3_to_oracle.cli:main
