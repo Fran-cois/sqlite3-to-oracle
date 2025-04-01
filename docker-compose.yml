@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  sqlite-to-oracle:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./data:/data
+      - ~/.oracle_config.json:/root/.oracle_config.json:ro
+    environment:
+      - ORACLE_ADMIN_USER=${ORACLE_ADMIN_USER:-system}
+      - ORACLE_ADMIN_PASSWORD=${ORACLE_ADMIN_PASSWORD}
+      - ORACLE_ADMIN_DSN=${ORACLE_ADMIN_DSN:-localhost:1521/XEPDB1}
+    command: --env-file=/data/oracle.env --sqlite_db=/data/input/database.sqlite

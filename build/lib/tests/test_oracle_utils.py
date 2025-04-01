@@ -6,7 +6,7 @@ import pytest
 import os
 import tempfile
 from unittest.mock import patch, mock_open, MagicMock
-from mariadb_to_oracle.oracle_utils import (
+from sqlite3_to_oracle.oracle_utils import (
     create_oracle_user,
     execute_sql_file,
     get_sqlalchemy_uri

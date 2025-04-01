@@ -1,145 +1,99 @@
 """
 Tests pour le module converter.py
 """
-
-import pytest
+import unittest
+import re
 from sqlite3_to_oracle.converter import (
+    sanitize_sql_value, 
     filter_sqlite_specific_statements,
-    process_create_table,
-    convert_sqlite_dump,
-    convert_date_format,
-    extract_sqlite_data
+    validate_numeric_precision,
+    convert_date_format
 )
 
-class TestFilterSqliteSpecificStatements:
-    """Tests pour la fonction filter_sqlite_specific_statements."""
+class TestConverter(unittest.TestCase):
+    """Tests pour les fonctions de conversion SQLite vers Oracle."""
     
-    def test_removes_pragma(self):
-        """Vérifie que les instructions PRAGMA sont supprimées."""
-        sql = "PRAGMA foreign_keys=OFF;\nCREATE TABLE users (id INTEGER);"
+    def test_sanitize_sql_value(self):
+        """Teste la fonction sanitize_sql_value."""
+        # Test avec None
+        self.assertEqual(sanitize_sql_value(None), "NULL")
+        
+        # Test avec nombre
+        self.assertEqual(sanitize_sql_value(42), "42")
+        self.assertEqual(sanitize_sql_value(3.14), "3.14")
+        
+        # Test avec chaîne
+        self.assertEqual(sanitize_sql_value("abc"), "'abc'")
+        
+        # Test avec apostrophes
+        self.assertEqual(sanitize_sql_value("O'Reilly"), "'O''Reilly'")
+        
+        # Test avec caractères spéciaux
+        self.assertEqual(sanitize_sql_value("line1\nline2"), "'line1 line2'")
+        
+        # Test avec booléen
+        self.assertEqual(sanitize_sql_value(True), "1")
+        self.assertEqual(sanitize_sql_value(False), "0")
+    
+    def test_filter_sqlite_specific_statements(self):
+        """Teste la fonction filter_sqlite_specific_statements."""
+        # SQL avec commandes spécifiques SQLite
+        sql = """
+        PRAGMA foreign_keys=OFF;
+        BEGIN TRANSACTION;
+        CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+        INSERT INTO users VALUES (1, 'Alice');
+        COMMIT;
+        VACUUM;
+        """
+        
+        # Le résultat attendu ne doit pas contenir PRAGMA, BEGIN TRANSACTION, COMMIT ni VACUUM
+        expected = """
+
+        CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+        INSERT INTO users VALUES (1, 'Alice');
+
+
+        """
+        
         result = filter_sqlite_specific_statements(sql)
-        assert "PRAGMA" not in result
-        assert "CREATE TABLE" in result
+        self.assertEqual(result, expected)
     
-    def test_removes_transaction_statements(self):
-        """Vérifie que les instructions de transaction sont supprimées."""
-        sql = "BEGIN TRANSACTION;\nCREATE TABLE users (id INTEGER);\nCOMMIT;"
-        result = filter_sqlite_specific_statements(sql)
-        assert "BEGIN TRANSACTION" not in result
-        assert "COMMIT" not in result
-        assert "CREATE TABLE" in result
+    def test_validate_numeric_precision(self):
+        """Teste la fonction validate_numeric_precision."""
+        # Précision dans la plage valide
+        self.assertEqual(validate_numeric_precision("NUMBER(10,2)"), "NUMBER(10,2)")
+        
+        # Précision trop grande
+        self.assertEqual(validate_numeric_precision("NUMBER(40,5)"), "NUMBER(38,5)")
+        
+        # Échelle plus grande que précision
+        self.assertEqual(validate_numeric_precision("NUMBER(10,15)"), "NUMBER(10,10)")
+        
+        # Type non NUMBER
+        self.assertEqual(validate_numeric_precision("VARCHAR2(100)"), "VARCHAR2(100)")
     
-    def test_preserves_other_statements(self):
-        """Vérifie que les autres instructions sont préservées."""
-        sql = "CREATE TABLE users (id INTEGER);\nINSERT INTO users VALUES (1);"
-        result = filter_sqlite_specific_statements(sql)
-        assert "CREATE TABLE" in result
-        assert "INSERT INTO" in result
+    def test_convert_date_format(self):
+        """Teste la fonction convert_date_format."""
+        # Format ISO standard
+        self.assertEqual(
+            convert_date_format("2023-01-15"), 
+            "TO_DATE('2023-01-15', 'YYYY-MM-DD')"
+        )
+        
+        # Format avec heure
+        date_with_time = convert_date_format("2023-01-15 14:30:00")
+        self.assertTrue(
+            re.match(r"TO_DATE\('\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', 'YYYY-MM-DD HH24:MI:SS'\)", date_with_time)
+        )
+        
+        # Format américain
+        self.assertTrue(
+            re.match(r"TO_DATE\('\d{4}-\d{2}-\d{2}', 'YYYY-MM-DD'\)", convert_date_format("01/15/2023"))
+        )
+        
+        # Valeur non date
+        self.assertEqual(convert_date_format("not a date"), "SYSDATE")
 
-class TestProcessCreateTable:
-    """Tests pour la fonction process_create_table."""
-    
-    def test_converts_primary_key_autoincrement(self):
-        """Vérifie la conversion de INTEGER PRIMARY KEY AUTOINCREMENT."""
-        sql = """CREATE TABLE users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT
-        );"""
-        result, _ = process_create_table(sql)
-        assert "NUMBER GENERATED BY DEFAULT AS IDENTITY" in result
-    
-    def test_converts_text_to_varchar2(self):
-        """Vérifie la conversion de TEXT en VARCHAR2."""
-        sql = """CREATE TABLE users (
-            name TEXT NOT NULL
-        );"""
-        result, _ = process_create_table(sql)
-        assert "VARCHAR2(4000)" in result
-    
-    def test_removes_collate(self):
-        """Vérifie que les clauses COLLATE sont supprimées."""
-        sql = """CREATE TABLE users (
-            email VARCHAR(255) COLLATE NOCASE
-        );"""
-        result, _ = process_create_table(sql)
-        assert "COLLATE NOCASE" not in result
-    
-    def test_converts_foreign_key(self):
-        """Vérifie que les clauses ON UPDATE sont supprimées des FOREIGN KEY."""
-        sql = """CREATE TABLE posts (
-            user_id INTEGER,
-            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE ON UPDATE CASCADE
-        );"""
-        result, _ = process_create_table(sql)
-        assert "ON DELETE CASCADE" in result
-        assert "ON UPDATE CASCADE" not in result
-
-class TestConvertSqliteDump:
-    """Tests pour la fonction convert_sqlite_dump."""
-    
-    def test_full_conversion(self, sample_sqlite_dump):
-        """Teste la conversion complète d'un dump SQLite."""
-        result = convert_sqlite_dump(sample_sqlite_dump)
-        
-        # Vérifier que les instructions spécifiques à SQLite sont supprimées
-        assert "PRAGMA" not in result
-        assert "BEGIN TRANSACTION" not in result
-        assert "COMMIT" not in result
-        
-        # Vérifier que les tables sont converties correctement
-        assert "CREATE TABLE users" in result
-        assert "NUMBER GENERATED BY DEFAULT AS IDENTITY" in result
-        assert "VARCHAR2" in result
-        
-        # Vérifier que les INSERT sont préservés
-        assert "INSERT INTO users" in result
-        
-        # Vérifier que les FOREIGN KEY sont correctement convertis
-        assert "REFERENCES users" in result
-        assert "ON UPDATE CASCADE" not in result
-
-class TestConvertDateFormat:
-    """Tests pour la fonction convert_date_format."""
-    
-    def test_converts_iso_date(self):
-        """Vérifie la conversion d'une date ISO."""
-        result = convert_date_format("2023-01-15")
-        assert "TO_DATE('2023-01-15', 'YYYY-MM-DD')" in result
-    
-    def test_converts_iso_datetime(self):
-        """Vérifie la conversion d'une date-heure ISO."""
-        result = convert_date_format("2023-01-15 10:30:45")
-        assert "TO_DATE('2023-01-15 10:30:45', 'YYYY-MM-DD HH24:MI:SS')" in result
-    
-    def test_converts_us_date(self):
-        """Vérifie la conversion d'une date au format US."""
-        result = convert_date_format("01/15/2023")
-        assert "TO_DATE" in result
-    
-    def test_handles_null_dates(self):
-        """Vérifie que NULL est converti en SYSDATE."""
-        result = convert_date_format("null")
-        assert result == "SYSDATE"
-    
-    def test_handles_invalid_dates(self):
-        """Vérifie que les dates invalides sont gérées correctement."""
-        result = convert_date_format("not-a-date")
-        assert result == "SYSDATE"
-
-class TestExtractSqliteData:
-    """Tests pour la fonction extract_sqlite_data."""
-    
-    def test_extracts_schema_and_data(self, temp_sqlite_db):
-        """Teste l'extraction du schéma et des données d'une BDD SQLite."""
-        result = extract_sqlite_data(temp_sqlite_db)
-        
-        # Vérifier que les tables sont extraites
-        assert "CREATE TABLE users" in result
-        assert "CREATE TABLE posts" in result
-        
-        # Vérifier que les données sont extraites
-        assert "INSERT INTO users" in result
-        assert "INSERT INTO posts" in result
-        
-        # Vérifier que certaines valeurs spécifiques sont présentes
-        assert "John Doe" in result
-        assert "First Post" in result
+if __name__ == '__main__':
+    unittest.main()

@@ -9,6 +9,7 @@ import datetime
 from typing import Dict, List, Tuple, Any, Optional
 from . import logger
 from .rich_logging import print_title, print_success_message, print_error_message, print_warning_message, RICH_AVAILABLE
+from .converter import sanitize_sql_value
 
 def connect_to_oracle(config: Dict[str, str]) -> Tuple[Optional[oracledb.Connection], Optional[str]]:
     """
@@ -227,6 +228,36 @@ def validate_schema(
     # Normaliser les noms de tables Oracle (les convertir en majuscules)
     oracle_tables = [table.upper() for table in oracle_tables]
     
+    # Détecter les tables qui semblent avoir été créées avec une structure simplifiée
+    simplified_tables = []
+    try:
+        # Vérifier les tables qui ont exactement les colonnes standard des tables simplifiées
+        cursor = oracle_conn.cursor()
+        for table in oracle_tables:
+            try:
+                # Vérifier si la table a les colonnes standard de la structure simplifiée
+                query = f"""
+                SELECT COUNT(*) FROM user_tab_columns 
+                WHERE table_name = '{table}' 
+                AND column_name IN ('ID', 'NAME', 'VALUE', 'CREATED_DATE', 'DESCRIPTION')
+                """
+                cursor.execute(query)
+                standard_cols_count = cursor.fetchone()[0]
+                
+                query = f"SELECT COUNT(*) FROM user_tab_columns WHERE table_name = '{table}'"
+                cursor.execute(query)
+                total_cols_count = cursor.fetchone()[0]
+                
+                # Si toutes les colonnes sont des colonnes standard et il y en a peu (2-5)
+                if standard_cols_count >= 2 and standard_cols_count == total_cols_count and total_cols_count <= 5:
+                    simplified_tables.append(table)
+                    logger.debug(f"Table {table} détectée comme table simplifiée")
+            except:
+                pass
+        cursor.close()
+    except:
+        logger.debug("Impossible de détecter les tables simplifiées")
+    
     # Résultats de validation
     results = {
         "success": True,
@@ -234,6 +265,7 @@ def validate_schema(
             "total_sqlite": len(sqlite_tables),
             "total_oracle": len(oracle_tables),
             "missing": [],
+            "simplified": simplified_tables,
             "details": {}
         },
         "data": {
@@ -371,6 +403,7 @@ def validate_schema(
     print("=" * 50)
     print(f"Tables SQLite: {results['tables']['total_sqlite']}")
     print(f"Tables Oracle: {results['tables']['total_oracle']}")
+    print(f"Tables avec structure simplifiée: {len(simplified_tables)}")
     print(f"Tables avec problèmes de schéma: {results['data']['tables_with_issues']}")
     print(f"Lignes dans SQLite: {results['data']['total_row_count_sqlite']}")
     print(f"Lignes dans Oracle: {results['data']['total_row_count_oracle']}")
@@ -384,6 +417,16 @@ def validate_schema(
     
     # Ajouter des détails supplémentaires en mode verbose
     if verbose:
+        # Détails des tables avec structure simplifiée
+        if simplified_tables:
+            print("\n" + "-" * 50)
+            print("TABLES AVEC STRUCTURE SIMPLIFIÉE")
+            print("-" * 50)
+            for table in simplified_tables:
+                print(f"- {table}")
+            print("\nCes tables ont été créées avec une structure simplifiée car leur schéma d'origine n'était pas compatible avec Oracle.")
+            print("Les données d'origine n'ont pas pu être importées pour ces tables.")
+        
         # Détails des tables avec problèmes de schéma
         if results['data']['tables_with_issues'] > 0:
             print("\n" + "-" * 50)
@@ -441,6 +484,72 @@ def validate_schema(
         print_warning_message("VALIDATION AVEC AVERTISSEMENTS")
     
     return results
+
+def insert_data_from_sqlite(oracle_cursor, sqlite_cursor, table_name, columns, batch_size=100):
+    """
+    Insère les données depuis SQLite vers Oracle pour une table donnée.
+    
+    Args:
+        oracle_cursor: Curseur Oracle
+        sqlite_cursor: Curseur SQLite
+        table_name: Nom de la table
+        columns: Liste des colonnes
+        batch_size: Nombre de lignes à insérer par batch
+    """
+    # Récupérer les données de SQLite
+    sqlite_cursor.execute(f"SELECT * FROM {table_name}")
+    rows = sqlite_cursor.fetchall()
+    
+    if not rows:
+        logger.debug(f"Aucune donnée à insérer pour la table {table_name}")
+        return 0
+    
+    # Préparer la requête d'insertion avec bind variables
+    placeholders = ", ".join([f":{i+1}" for i in range(len(columns))])
+    insert_query = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({placeholders})"
+    
+    inserted = 0
+    errors = 0
+    
+    try:
+        # Insérer par batch
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i+batch_size]
+            batch_data = []
+            
+            # Sanitiser les données de chaque ligne
+            for row in batch:
+                sanitized_row = [sanitize_sql_value(value) if isinstance(value, str) else value for value in row]
+                batch_data.append(sanitized_row)
+            
+            try:
+                oracle_cursor.executemany(insert_query, batch_data)
+                inserted += len(batch)
+            except Exception as e:
+                # Essayer d'insérer ligne par ligne en cas d'erreur
+                for row in batch_data:
+                    try:
+                        oracle_cursor.execute(insert_query, row)
+                        inserted += 1
+                    except Exception as row_error:
+                        errors += 1
+                        logger.debug(f"Erreur lors de l'insertion dans {table_name}: {str(row_error)}")
+                        # Afficher les 50 premiers caractères de la ligne problématique
+                        logger.debug(f"Données: {str(row)[:50]}...")
+        
+        logger.info(f"Insertion des données dans {table_name} ({inserted} lignes, {errors} erreurs)...")
+        return inserted
+    except Exception as e:
+        error_code = None
+        if hasattr(e, 'args') and e.args:
+            error_info = e.args[0]
+            if hasattr(error_info, 'code'):
+                error_code = error_info.code
+        
+        logger.debug(f"Erreur {error_code or 'inconnue'} lors de l'insertion dans {table_name}: {str(e)}")
+        if "ORA-00917" in str(e):
+            logger.debug("Help: https://docs.oracle.com/error-help/db/ora-00917/")
+        return 0
 
 def run_validation(
     sqlite_path: str,

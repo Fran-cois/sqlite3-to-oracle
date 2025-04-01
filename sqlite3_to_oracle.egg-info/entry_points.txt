@@ -1,2 +1,3 @@
 [console_scripts]
+reload-missing-tables = reload_missing_tables:main
 sqlite3-to-oracle = sqlite3_to_oracle.cli:main

@@ -1,22 +1,31 @@
+LICENSE
 README.md
 pyproject.toml
 setup.py
 sqlite3_to_oracle/__init__.py
 sqlite3_to_oracle/__main__.py
-sqlite3_to_oracle/cli copy.py
+sqlite3_to_oracle/bitmap_indexes.py
 sqlite3_to_oracle/cli.py
-sqlite3_to_oracle/config copy.py
 sqlite3_to_oracle/config.py
 sqlite3_to_oracle/converter.py
+sqlite3_to_oracle/data_loader.py
 sqlite3_to_oracle/display_config.py
+sqlite3_to_oracle/lookup_loader.py
 sqlite3_to_oracle/oracle_utils.py
+sqlite3_to_oracle/performance_loader.py
 sqlite3_to_oracle/rich_logging.py
 sqlite3_to_oracle/schema_validator.py
+sqlite3_to_oracle/sqlite_utils.py
+sqlite3_to_oracle/table_utils.py
+sqlite3_to_oracle/validation.py
 sqlite3_to_oracle.egg-info/PKG-INFO
 sqlite3_to_oracle.egg-info/SOURCES.txt
 sqlite3_to_oracle.egg-info/dependency_links.txt
 sqlite3_to_oracle.egg-info/entry_points.txt
 sqlite3_to_oracle.egg-info/requires.txt
 sqlite3_to_oracle.egg-info/top_level.txt
+tests/__init__.py
+tests/conftest.py
+tests/test_config.py
 tests/test_converter.py
 tests/test_oracle_utils.py

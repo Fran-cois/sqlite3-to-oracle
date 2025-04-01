@@ -4,46 +4,57 @@ Interface en ligne de commande pour le convertisseur SQLite vers Oracle.
 Ce module fournit une interface utilisateur simple pour convertir une base de données
 SQLite vers Oracle, en créant automatiquement l'utilisateur et en exécutant le script.
 """
-
-import os
-import re
-import sys
-import logging
 import argparse
-import sqlite3
+import sys
+import os
+import logging
+import io
+import glob
+import time
 from typing import Dict, Tuple, Optional, List, Any
 
 from . import ORACLE_CONFIG, logger
-from .config import load_oracle_config
-from .converter import extract_sqlite_data, convert_sqlite_dump
+from .config import load_oracle_config, save_oracle_config
+from .converter import convert_sqlite_dump
 from .oracle_utils import (
     create_oracle_user, 
     execute_sql_file, 
     display_sqlalchemy_info,
     recreate_oracle_user,
     get_oracle_username_from_filepath,
-    check_oracle_connection
+    check_oracle_connection,
+    export_validation_report
 )
-
-# Importer les utilitaires de logging riche
+from .schema_validator import run_validation
+from .data_loader import reload_missing_tables
 from .rich_logging import (
     setup_logger,
     print_title,
     print_success_message,
     print_error_message,
+    print_warning_message,
+    print_exception,
     get_progress_bar,
     RICH_AVAILABLE,
     get_log_manager
 )
+from .validation import (
+    validate_single_schema, 
+    validate_schema_with_output, 
+    process_batch_validation,
+    validate_credentials
+)
+from .sqlite_utils import extract_sqlite_content
 
-try:
-    from rich.console import Console
-    from rich.markdown import Markdown
-    from rich.panel import Panel
-    from rich.table import Table
-    from rich.text import Text
-except ImportError:
-    pass
+if RICH_AVAILABLE:
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+    except ImportError:
+        pass
 
 class RichHelpFormatter(argparse.HelpFormatter):
     """Formateur d'aide personnalisé utilisant rich pour un affichage amélioré."""
@@ -56,31 +67,23 @@ class RichHelpFormatter(argparse.HelpFormatter):
         if not RICH_AVAILABLE:
             return super()._format_usage(usage, actions, groups, prefix)
         
-        # Capturer la sortie standard pour pouvoir la modifier
-        import io
         from contextlib import redirect_stdout
         
         f = io.StringIO()
         with redirect_stdout(f):
             super()._format_usage(usage, actions, groups, prefix)
-        
-        usage_text = f.getvalue()
-        # On ne retourne rien ici, le usage sera affiché dans la méthode _display_rich_help
         return ""
-    
+
     def _format_action(self, action):
         if not RICH_AVAILABLE:
             return super()._format_action(action)
         
-        # On capture simplement les actions pour les afficher avec rich plus tard
         return ""
     
     def format_help(self):
         if not RICH_AVAILABLE:
             return super().format_help()
         
-        # On retourne une chaîne vide ici car on affichera l'aide avec rich
-        # après l'appel à format_help dans parse_arguments
         return ""
 
 def display_rich_help(parser: argparse.ArgumentParser) -> None:
@@ -91,17 +94,14 @@ def display_rich_help(parser: argparse.ArgumentParser) -> None:
     
     console = Console()
     
-    # Titre et description
     console.print(f"\n[bold magenta]{parser.prog}[/bold magenta]")
     console.print("─" * len(parser.prog))
     console.print(f"[italic]{parser.description}[/italic]\n")
     
-    # Usage
     usage = parser.format_usage().replace("usage: ", "")
     console.print("[bold cyan]USAGE[/bold cyan]")
     console.print(f"  {usage}\n")
     
-    # Tables d'options par groupe
     for group in parser._action_groups:
         if not group._group_actions:
             continue
@@ -116,20 +116,17 @@ def display_rich_help(parser: argparse.ArgumentParser) -> None:
             if action.help == argparse.SUPPRESS:
                 continue
                 
-            # Formater les options
             opts = []
             if action.option_strings:
                 opts = ", ".join(action.option_strings)
             else:
                 opts = action.dest
                 
-            # Ajouter le type/valeurs pour les options avec des choix ou un type spécifique
             if action.choices:
                 opts += f" {{{', '.join(map(str, action.choices))}}}"
             elif action.type and action.type.__name__ not in ('str', '_StoreAction'):
                 opts += f" <{action.type.__name__}>"
                 
-            # Ajouter l'aide
             help_text = action.help or ""
             if action.default and action.default != argparse.SUPPRESS:
                 if action.default not in (None, '', False):
@@ -140,10 +137,8 @@ def display_rich_help(parser: argparse.ArgumentParser) -> None:
         console.print(table)
         console.print()
     
-    # Épilogue
     if parser.epilog:
         console.print("[bold cyan]EXEMPLES[/bold cyan]")
-        # Formater l'épilogue comme du markdown
         md = Markdown(parser.epilog)
         console.print(md)
 
@@ -198,7 +193,6 @@ sqlite3-to-oracle --validate-credentials-only
         """
     )
     
-    # Groupe d'options pour la source (SQLite)
     source_group = parser.add_argument_group('Options de source')
     source_group.add_argument('--sqlite_db', 
                              help='Chemin vers le fichier de base de données SQLite')
@@ -208,8 +202,21 @@ sqlite3-to-oracle --validate-credentials-only
                              help="Valider le schéma et les données après l'importation (activé par défaut)")
     source_group.add_argument('--no-validate-schema', action='store_false', dest='validate_schema',
                              help="Désactiver la validation du schéma après l'importation")
+    source_group.add_argument('--validate-schema-only', action='store_true',
+                             help="Exécuter uniquement la validation du schéma sur une base déjà importée")
+    source_group.add_argument('--retry', action='store_true',
+                             help="Tenter de recharger les tables qui ont échoué lors d'une précédente importation")
+    source_group.add_argument('--use-varchar', action='store_true', 
+                             help="Utiliser VARCHAR2 pour les colonnes avec valeurs décimales problématiques")
+    source_group.add_argument('--only-fk-keys', action='store_true', 
+                              help="Ne conserver que les clés primaires et les colonnes utilisées dans les clés étrangères")
+    source_group.add_argument('--disable-bitmap-indexes', action='store_true',
+                              help="Désactiver la création automatique d'index bitmap")
+    source_group.add_argument('--bitmap-ratio', type=float, default=0.1,
+                              help="Ratio maximal pour les colonnes candidates aux index bitmap (défaut: 0.1)")
+    source_group.add_argument('--exclude-tables-from-bitmap', 
+                              help="Tables à exclure de la création d'index bitmap (séparées par des virgules)")
     
-    # Groupe d'options pour la cible (Oracle)
     target_group = parser.add_argument_group('Options de cible Oracle')
     target_group.add_argument('--new-username', 
                              help="Nom du nouvel utilisateur Oracle à créer (par défaut: nom de la base)")
@@ -224,7 +231,6 @@ sqlite3-to-oracle --validate-credentials-only
     target_group.add_argument('--schema-only', action='store_true',
                              help='Convertir uniquement le schéma, sans les données')
     
-    # Groupe d'options pour l'administration Oracle 
     admin_group = parser.add_argument_group('Options d\'administration Oracle')
     admin_group.add_argument('--oracle-admin-user', 
                             help="Nom d'utilisateur administrateur Oracle (défaut: system)")
@@ -241,14 +247,24 @@ sqlite3-to-oracle --validate-credentials-only
     admin_group.add_argument('--validate-credentials-only', action='store_true',
                             help="Vérifier uniquement les identifiants Oracle sans effectuer de conversion")
     
-    # Groupe d'options pour le logging
     log_group = parser.add_argument_group('Options de logging')
     log_group.add_argument('--verbose', '-v', action='store_true',
                           help='Activer les messages de débogage détaillés')
     log_group.add_argument('--quiet', '-q', action='store_true',
                           help='Afficher uniquement les erreurs (mode silencieux)')
     
-    # Si rich est disponible, afficher une aide enrichie
+    batch_group = parser.add_argument_group('Options de traitement par lots')
+    batch_group.add_argument('--batch', action='store_true',
+                            help="Activer le mode de traitement par lots pour importer plusieurs bases de données")
+    batch_group.add_argument('--sqlite-dir',
+                            help="Répertoire contenant les fichiers SQLite à importer en lot")
+    batch_group.add_argument('--file-pattern', default="*.db",
+                            help="Motif de fichiers à traiter (par défaut: *.sqlite)")
+    batch_group.add_argument('--uri-output-file',
+                            help="Fichier de sortie pour enregistrer les URIs SQLAlchemy générées")
+    batch_group.add_argument('--continue-on-error', action='store_true',
+                            help="Continuer le traitement par lots même en cas d'erreur sur une base")
+    
     if RICH_AVAILABLE and len(sys.argv) == 1 or '--help' in sys.argv or '-h' in sys.argv:
         display_rich_help(parser)
         sys.exit(0)
@@ -266,75 +282,7 @@ def setup_logging(args: argparse.Namespace) -> None:
     else:
         level = logging.INFO
     
-    # Réinitialiser le logger avec le niveau approprié
     logger = setup_logger("sqlite3_to_oracle", level)
-
-def extract_sqlite_content(sqlite_path: str) -> str:
-    """
-    Extrait le contenu SQL de la base SQLite.
-    Utilise d'abord extract_sqlite_data, puis une méthode alternative en cas d'échec.
-    
-    Args:
-        sqlite_path: Chemin vers le fichier SQLite
-        
-    Returns:
-        Le contenu SQL extrait
-        
-    Raises:
-        SystemExit: Si l'extraction échoue avec les deux méthodes
-    """
-    try:
-        logger.info(f"Extraction des données depuis {sqlite_path}...")
-        sqlite_sql = extract_sqlite_data(sqlite_path)
-        logger.debug("Extraction réussie avec extract_sqlite_data()")
-        return sqlite_sql
-    except Exception as e:
-        logger.warning(f"Échec de l'extraction principale: {str(e)}")
-        logger.info("Tentative d'extraction alternative...")
-        
-        try:
-            # Méthode de secours
-            conn = sqlite3.connect(sqlite_path)
-            cursor = conn.cursor()
-            
-            # Récupérer les tables
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-            tables = cursor.fetchall()
-            
-            if not tables:
-                logger.error("Aucune table trouvée dans la base de données")
-                sys.exit(1)
-                
-            logger.info(f"Tables trouvées: {', '.join(t[0] for t in tables)}")
-            
-            all_sql = []
-            for table in tables:
-                table_name = table[0]
-                try:
-                    # Vérifier si on peut lire la table
-                    cursor.execute(f"SELECT * FROM {table_name} LIMIT 1;")
-                    cursor.fetchall()
-                    
-                    # Exporter la table
-                    table_sql = "\n".join(conn.iterdump() if hasattr(conn, 'table_name') 
-                                         else [f"-- Table {table_name} extraite"])
-                    all_sql.append(table_sql)
-                    logger.debug(f"Table {table_name} extraite avec succès")
-                except Exception as table_error:
-                    logger.warning(f"Impossible d'extraire la table {table_name}: {str(table_error)}")
-                    all_sql.append(f"-- Échec de l'extraction de la table {table_name}")
-            
-            conn.close()
-            sqlite_sql = "\n".join(all_sql)
-            
-            if not sqlite_sql.strip():
-                raise ValueError("Aucune donnée extraite")
-                
-            return sqlite_sql
-        except Exception as e2:
-            logger.error(f"Échec de la méthode alternative: {str(e2)}")
-            logger.error("Impossible d'extraire les données de la base SQLite")
-            sys.exit(1)
 
 def determine_oracle_username(db_path: str, args: argparse.Namespace) -> Tuple[str, str]:
     """
@@ -347,10 +295,8 @@ def determine_oracle_username(db_path: str, args: argparse.Namespace) -> Tuple[s
     Returns:
         Tuple contenant (nom d'utilisateur, mot de passe)
     """
-    # Obtenir un nom d'utilisateur Oracle valide à partir du chemin
     oracle_username = get_oracle_username_from_filepath(db_path)
     
-    # Utiliser les arguments CLI s'ils sont fournis
     username = args.new_username if args.new_username else oracle_username
     password = args.new_password if args.new_password else username
     
@@ -367,135 +313,50 @@ def save_oracle_sql(oracle_sql: str, output_file: str) -> None:
         logger.error(f"Erreur lors de l'écriture du fichier de sortie: {e}")
         sys.exit(1)
 
-def validate_credentials(admin_config: Dict[str, str], new_username: str, new_password: str) -> Tuple[bool, str]:
-    """
-    Valide les identifiants administrateur et simule la création d'utilisateur.
-    
-    Args:
-        admin_config: Configuration Oracle administrateur
-        new_username: Nom du nouvel utilisateur à créer
-        new_password: Mot de passe du nouvel utilisateur à créer
-        
-    Returns:
-        Tuple contenant (résultat de validation, message)
-    """
-    # 1. Vérifier la connexion administrateur
-    admin_success, admin_message = check_oracle_connection(admin_config)
-    if not admin_success:
-        return False, f"Échec de la connexion administrateur Oracle: {admin_message}"
-    
-    # 2. Vérifier les privilèges administrateur
-    import oracledb
+def process_single_database(sqlite_db_path: str, args: argparse.Namespace, log_manager) -> Optional[Dict[str, str]]:
     try:
-        admin_conn = oracledb.connect(
-            user=admin_config["user"],
-            password=admin_config["password"],
-            dsn=admin_config["dsn"]
-        )
-        cursor = admin_conn.cursor()
-        
-        # Vérifier si l'administrateur a le privilège CREATE USER
-        cursor.execute("SELECT PRIVILEGE FROM SESSION_PRIVS WHERE PRIVILEGE = 'CREATE USER'")
-        admin_has_create_user = bool(cursor.fetchone())
-        
-        if not admin_has_create_user:
-            return False, f"L'utilisateur administrateur {admin_config['user']} n'a pas le privilège CREATE USER nécessaire pour créer un nouvel utilisateur"
-        
-        # Vérifier si l'utilisateur existe déjà
-        try:
-            cursor.execute(f"SELECT 1 FROM DBA_USERS WHERE USERNAME = UPPER('{new_username}')")
-            user_exists = bool(cursor.fetchone())
+        if args.validate_schema:
+            from .validation import validate_single_schema
+            import io
+            import sys
             
-            if user_exists:
-                # Tester la connexion avec cet utilisateur
-                test_config = {
-                    "user": new_username,
-                    "password": new_password,
-                    "dsn": admin_config["dsn"]
-                }
-                user_success, user_message = check_oracle_connection(test_config)
-                
-                if not user_success:
-                    return False, f"L'utilisateur {new_username} existe mais le mot de passe fourni est incorrect: {user_message}"
-                
-                return True, f"Utilisateur {new_username} validé avec succès (utilisateur existant)"
-            else:
-                # Vérifier si l'administrateur a les privilèges pour accorder des droits
-                cursor.execute("SELECT PRIVILEGE FROM SESSION_PRIVS WHERE PRIVILEGE = 'GRANT ANY PRIVILEGE'")
-                can_grant_privileges = bool(cursor.fetchone())
-                
-                # Vérifier si l'administrateur peut accorder CREATE SESSION
-                cursor.execute("SELECT PRIVILEGE FROM SESSION_PRIVS WHERE PRIVILEGE IN ('CREATE SESSION', 'GRANT ANY PRIVILEGE')")
-                can_grant_session = bool(cursor.fetchone())
-                
-                # Si l'admin ne peut pas accorder les privilèges, vérifier s'il peut accorder le rôle RESOURCE
-                if not can_grant_privileges:
-                    cursor.execute("SELECT PRIVILEGE FROM SESSION_PRIVS WHERE PRIVILEGE = 'GRANT ANY ROLE'")
-                    can_grant_roles = bool(cursor.fetchone())
-                    
-                    if not can_grant_roles:
-                        # Vérifier si la base peut créer des utilisateurs 
-                        # même sans tous les privilèges attendus
-                        return True, f"L'utilisateur administrateur {admin_config['user']} a des droits limités mais devrait pouvoir créer un utilisateur"
-                
-                # Vérification plus souple - considérer que si l'admin peut créer un utilisateur
-                # et a soit le droit d'accorder des privilèges, soit d'accorder des rôles,
-                # c'est suffisant pour continuer
-                return True, f"L'utilisateur {new_username} peut être créé par l'administrateur {admin_config['user']}"
-                
-        except oracledb.DatabaseError as e:
-            error, = e.args
-            # Si nous ne pouvons pas interroger DBA_USERS, essayons ALL_USERS (moins de privilèges requis)
-            if "ORA-00942" in str(error):  # table or view does not exist
-                try:
-                    cursor.execute(f"SELECT 1 FROM ALL_USERS WHERE USERNAME = UPPER('{new_username}')")
-                    user_exists = bool(cursor.fetchone())
-                    
-                    if user_exists:
-                        # Même logique que ci-dessus pour l'utilisateur existant
-                        test_config = {
-                            "user": new_username,
-                            "password": new_password,
-                            "dsn": admin_config["dsn"]
-                        }
-                        user_success, user_message = check_oracle_connection(test_config)
-                        
-                        if not user_success:
-                            return False, f"L'utilisateur {new_username} existe mais le mot de passe fourni est incorrect: {user_message}"
-                        
-                        return True, f"Utilisateur {new_username} validé avec succès (utilisateur existant)"
-                    else:
-                        # Nous ne pouvons pas vérifier toutes les permissions détaillées,
-                        # mais nous pouvons voir si l'admin peut se connecter, ce qui est un bon début
-                        return True, f"L'utilisateur administrateur {admin_config['user']} peut se connecter, tentative de création d'utilisateur"
-                except:
-                    # Si même ALL_USERS n'est pas accessible, nous sommes probablement en mode limité
-                    # Continuons quand même si la connexion admin fonctionne
-                    return True, f"Vérification des privilèges limitée, mais connexion admin OK"
-            return False, f"Erreur lors de la vérification de l'utilisateur: {error.message}"
+            user_config = {
+                "user": args.new_username,
+                "password": args.new_password,
+                "dsn": ORACLE_CONFIG["dsn"]
+            }
             
+            success, report_file = validate_single_schema(
+                sqlite_db_path,
+                user_config,
+                verbose=args.verbose
+            )
+            
+            if report_file:
+                logger.info(f"Rapport de validation exporté dans {report_file}")
+        
+        return {
+            "user": args.new_username,
+            "password": args.new_password,
+            "dsn": ORACLE_CONFIG["dsn"],
+            "source_db": sqlite_db_path
+        }
     except Exception as e:
-        return False, f"Erreur lors de la validation des identifiants: {str(e)}"
-    finally:
-        if 'cursor' in locals():
-            cursor.close()
-        if 'admin_conn' in locals():
-            admin_conn.close()
+        logger.error(f"Erreur lors du traitement de la base: {str(e)}")
+        return None
 
 def main() -> None:
-    """Point d'entrée principal pour l'outil en ligne de commande"""
-    # Étape 1: Analyser les arguments et configurer le logging
+    import os
+    
     args = parse_arguments()
     setup_logging(args)
     
-    # Obtenir le gestionnaire de logging
     log_manager = get_log_manager()
     log_manager.set_log_level(logging.DEBUG if args.verbose else logging.ERROR if args.quiet else logging.INFO)
     
     try:
         print_title("SQLite to Oracle Converter")
         
-        # Étape 1.5: Charger la configuration Oracle et les variables d'environnement
         global ORACLE_CONFIG
         ORACLE_CONFIG, env_cli_args = load_oracle_config(
             cli_config={
@@ -507,21 +368,13 @@ def main() -> None:
             env_file=args.env_file
         )
         
-        # Pour le mode verbose, afficher les paramètres de connexion (masqués)
-        if args.verbose:
-            user = ORACLE_CONFIG.get("user", "non spécifié")
-            dsn = ORACLE_CONFIG.get("dsn", "non spécifié")
-            password = "*****" if ORACLE_CONFIG.get("password") else "non spécifié"
-            
-            logger.debug(f"Paramètres de connexion Oracle:")
-            logger.debug(f"  - Utilisateur: {user}")
-            logger.debug(f"  - DSN: {dsn}")
-            logger.debug(f"  - Mot de passe: {password}")
-        
         # Fusionner les arguments CLI avec ceux provenant des variables d'environnement
         # Les arguments CLI ont la priorité
         if env_cli_args:
             for key, value in env_cli_args.items():
+                if args.verbose:
+                    logger.debug(f"Traitement de la variable d'environnement {key}={value}")
+                
                 if key == 'sqlite_db' and not args.sqlite_db:
                     args.sqlite_db = value
                 elif key == 'output_file' and not args.output_file:
@@ -536,6 +389,30 @@ def main() -> None:
                     args.force_recreate = value
                 elif key == 'schema_only' and not args.schema_only:
                     args.schema_only = value
+                elif key == 'batch' and not args.batch:
+                    args.batch = value
+                    logger.debug(f"Mode batch activé depuis .env: {value}")
+                elif key == 'sqlite_dir' and not args.sqlite_dir:
+                    args.sqlite_dir = value
+                    logger.debug(f"Répertoire SQLite défini via variable d'environnement: {value}")
+                elif key == 'file_pattern' and not args.file_pattern:
+                    args.file_pattern = value
+                elif key == 'uri_output_file' and not args.uri_output_file:
+                    args.uri_output_file = value
+                elif key == 'continue_on_error' and not args.continue_on_error:
+                    args.continue_on_error = value
+        
+        # Vérifier explicitement si le mode batch est activé depuis l'environnement
+        batch_from_env = False
+        if not args.batch:
+            if os.environ.get('ORACLE_BATCH', '').lower() in ('true', 'yes', '1'):
+                args.batch = True
+                batch_from_env = True
+                logger.debug("Mode batch activé directement depuis la variable d'environnement ORACLE_BATCH")
+            elif env_cli_args and env_cli_args.get('batch') in (True, 'True', 'true', 'yes', '1', 1):
+                args.batch = True
+                batch_from_env = True
+                logger.debug("Mode batch activé depuis le fichier d'environnement")
         
         # Vérifier que les identifiants administrateur sont valides
         if not all(key in ORACLE_CONFIG and ORACLE_CONFIG[key] for key in ("user", "password", "dsn")):
@@ -545,254 +422,243 @@ def main() -> None:
             logger.info("Ou utilisez un fichier .env ou ~/.oracle_config.json")
             sys.exit(1)
         
-        # Récupérer/initialiser le nom d'utilisateur et mot de passe cible
-        if args.use_admin_user:
-            target_username = ORACLE_CONFIG["user"]
-            target_password = ORACLE_CONFIG["password"]
-            logger.info(f"Utilisation de l'utilisateur admin pour toutes les opérations: [bold cyan]{target_username}[/bold cyan]")
-        elif args.sqlite_db:
-            target_username, target_password = determine_oracle_username(args.sqlite_db, args)
-            logger.info(f"Cible: Nouvel utilisateur Oracle: [bold cyan]{target_username}[/bold cyan]")
-        else:
-            # Pour --check-connection-only ou --validate-credentials-only sans --sqlite_db
-            target_username = args.new_username or "new_user"
-            target_password = args.new_password or target_username
-            logger.info(f"Cible: Nouvel utilisateur Oracle: [bold cyan]{target_username}[/bold cyan]")
-        
-        # Étape 1.6: Vérifier la connexion Oracle administrateur et la validité des identifiants
-        print_title("Vérification des connexions Oracle")
-        logger.info("Validation des identifiants Oracle...")
-        
-        # Ajouter un mode debug détaillé pour --check-connection-only
-        if args.check_connection_only and args.verbose:
-            logger.debug("Mode test de connexion avec débogage détaillé")
-            logger.debug(f"Tentative de connexion avec: user={ORACLE_CONFIG['user']}, dsn={ORACLE_CONFIG['dsn']}")
-        
-        admin_success, admin_message = check_oracle_connection(ORACLE_CONFIG)
-        if admin_success:
-            logger.info(f"✓ Utilisateur admin: {admin_message}")
+        # Vérifier et afficher clairement le mode de fonctionnement
+        if args.validate_schema_only and args.batch:
+            logger.info("Mode batch de validation de schéma uniquement activé")
             
-            # Si on est en mode check-connection-only, afficher plus d'informations
-            if args.check_connection_only:
-                try:
-                    import oracledb
-                    conn = oracledb.connect(
-                        user=ORACLE_CONFIG["user"],
-                        password=ORACLE_CONFIG["password"],
-                        dsn=ORACLE_CONFIG["dsn"]
-                    )
-                    cursor = conn.cursor()
-                    
-                    # Récupérer et afficher les tablespaces
+            if not args.sqlite_dir:
+                # Vérifier si le répertoire SQLite est dans les variables d'environnement
+                if 'ORACLE_SQLITE_DIR' in os.environ:
+                    args.sqlite_dir = os.environ.get('ORACLE_SQLITE_DIR')
+                    logger.info(f"Répertoire SQLite obtenu depuis ORACLE_SQLITE_DIR: {args.sqlite_dir}")
+                elif env_cli_args and 'sqlite_dir' in env_cli_args:
+                    args.sqlite_dir = env_cli_args['sqlite_dir']
+                    logger.info(f"Répertoire SQLite obtenu depuis le fichier d'environnement: {args.sqlite_dir}")
+                else:
+                    print_error_message("Répertoire SQLite non spécifié pour le mode batch")
+                    logger.error("Utilisez --sqlite-dir ou la variable d'environnement ORACLE_SQLITE_DIR")
+                    sys.exit(1)
+            
+            if not os.path.isdir(args.sqlite_dir):
+                print_error_message(f"Le répertoire {args.sqlite_dir} n'existe pas.")
+                sys.exit(1)
+            
+            logger.info(f"Validation des bases SQLite dans le répertoire: {args.sqlite_dir}")
+            successful_validations = process_batch_validation(
+                oracle_config=ORACLE_CONFIG,
+                sqlite_dir=args.sqlite_dir,
+                file_pattern=args.file_pattern,
+                use_admin_user=args.use_admin_user,
+                new_username=args.new_username,
+                new_password=args.new_password,
+                continue_on_error=args.continue_on_error,
+                verbose=args.verbose
+            )
+            
+            if successful_validations:
+                print_success_message(f"Validation par lots terminée avec {len(successful_validations)} bases validées avec succès")
+                
+                # Rechercher les rapports générés
+                import glob
+                
+                # Rapport détaillé
+                latest_report = None
+                report_files = glob.glob(os.path.join(args.sqlite_dir, "validation_batch_report_*.md"))
+                if report_files:
+                    latest_report = max(report_files, key=os.path.getmtime)
+                
+                # Rapport global
+                overall_report = os.path.join(args.sqlite_dir, "overall_report.md")
+                has_overall_report = os.path.exists(overall_report)
+                
+                # Afficher les rapports si Rich est disponible
+                if RICH_AVAILABLE and not args.quiet:
                     try:
-                        cursor.execute("SELECT TABLESPACE_NAME FROM USER_TABLESPACES")
-                        tablespaces = [row[0] for row in cursor.fetchall()]
-                        logger.info(f"Tablespaces disponibles: {', '.join(tablespaces)}")
-                    except:
-                        logger.debug("Impossible de récupérer la liste des tablespaces")
-                    
-                    # Récupérer et afficher les privilèges système
-                    try:
-                        cursor.execute("SELECT * FROM SESSION_PRIVS")
-                        privileges = [row[0] for row in cursor.fetchall()]
-                        logger.info(f"Privilèges disponibles: {', '.join(privileges[:5])}..." if len(privileges) > 5 else f"Privilèges disponibles: {', '.join(privileges)}")
-                    except:
-                        logger.debug("Impossible de récupérer la liste des privilèges")
-                    
-                    cursor.close()
-                    conn.close()
-                except Exception as e:
-                    logger.debug(f"Erreur lors de la récupération des détails supplémentaires: {str(e)}")
+                        from rich.console import Console
+                        from rich.markdown import Markdown
+                        
+                        console = Console()
+                        
+                        # Afficher directement le rapport global s'il existe
+                        if has_overall_report:
+                            print(f"\nRapport global d'état:")
+                            with open(overall_report, 'r', encoding='utf-8') as f:
+                                md = Markdown(f.read())
+                            console.print(md)
+                            print(f"\nRapport global sauvegardé dans: {overall_report}")
+                        
+                        # Pour le rapport détaillé, indiquer simplement son emplacement
+                        if latest_report:
+                            print(f"\nRapport détaillé disponible: {latest_report}")
+                            
+                    except Exception as e:
+                        logger.debug(f"Erreur lors de l'affichage des rapports: {str(e)}")
+                
+                # Afficher simplement les chemins des rapports si on est en mode silencieux ou sans Rich
+                elif latest_report or has_overall_report:
+                    if has_overall_report:
+                        print(f"\nRapport global disponible: {overall_report}")
+                    if latest_report:
+                        print(f"Rapport détaillé disponible: {latest_report}")
+            else:
+                print_error_message("Aucune base n'a été validée avec succès")
+                sys.exit(1)
             
-        else:
-            print_error_message(f"Problème d'identifiants administrateur Oracle: {admin_message}")
-            
-            # Ajouter des suggestions de résolution selon l'erreur
-            if "ORA-01017" in admin_message:
-                logger.error("Solution possible: Vérifiez que le nom d'utilisateur et le mot de passe sont corrects")
-                logger.error("  Utilisateur spécifié: " + ORACLE_CONFIG.get("user", "non spécifié"))
-            elif "ORA-12541" in admin_message or "ORA-12514" in admin_message:
-                logger.error("Solution possible: Vérifiez que le service Oracle est démarré et accessible")
-                logger.error("  DSN spécifié: " + ORACLE_CONFIG.get("dsn", "non spécifié"))
-                logger.error("  Format attendu: hostname:port/service_name")
-            logger.error("Veuillez vérifier vos identifiants Oracle admin et réessayer.")
-            sys.exit(1)
-        
-        # Si l'option --check-connection-only ou --validate-credentials-only est spécifiée, s'arrêter ici
-        if args.check_connection_only or args.validate_credentials_only:
-            print_success_message("La connexion Oracle a été validée avec succès.")
-            logger.info(f"Admin: {ORACLE_CONFIG['user']}@{ORACLE_CONFIG['dsn']}")
-            if not args.check_connection_only:  # Si c'est validate-credentials-only
-                logger.info(f"Utilisateur cible: {target_username}")
             sys.exit(0)
+        elif args.validate_schema_only:
+            logger.info("Mode validation de schéma uniquement activé")
+            
+            # Si batch est détecté depuis les variables d'environnement mais pas spécifié explicitement
+            if batch_from_env:
+                logger.info("Mode batch détecté depuis les variables d'environnement")
+                
+                # Rediriger vers le mode batch
+                if not args.sqlite_dir:
+                    # Vérifier si le répertoire SQLite est dans les variables d'environnement
+                    if 'ORACLE_SQLITE_DIR' in os.environ:
+                        args.sqlite_dir = os.environ.get('ORACLE_SQLITE_DIR')
+                        logger.info(f"Répertoire SQLite obtenu depuis ORACLE_SQLITE_DIR: {args.sqlite_dir}")
+                    elif env_cli_args and 'sqlite_dir' in env_cli_args:
+                        args.sqlite_dir = env_cli_args['sqlite_dir']
+                        logger.info(f"Répertoire SQLite obtenu depuis le fichier d'environnement: {args.sqlite_dir}")
+                    else:
+                        print_error_message("Répertoire SQLite non spécifié pour le mode batch")
+                        logger.error("Utilisez --sqlite-dir ou la variable d'environnement ORACLE_SQLITE_DIR")
+                        sys.exit(1)
+                
+                if not os.path.isdir(args.sqlite_dir):
+                    print_error_message(f"Le répertoire {args.sqlite_dir} n'existe pas.")
+                    sys.exit(1)
+                
+                logger.info(f"Validation des bases SQLite dans le répertoire: {args.sqlite_dir}")
+                successful_validations = process_batch_validation(
+                    oracle_config=ORACLE_CONFIG,
+                    sqlite_dir=args.sqlite_dir,
+                    file_pattern=args.file_pattern,
+                    use_admin_user=args.use_admin_user,
+                    new_username=args.new_username,
+                    new_password=args.new_password,
+                    continue_on_error=args.continue_on_error,
+                    verbose=args.verbose
+                )
+                
+                if successful_validations:
+                    print_success_message(f"Validation par lots terminée avec {len(successful_validations)} bases validées avec succès")
+                    
+                    # Rechercher les rapports générés
+                    import glob
+                    
+                    # Rapport détaillé
+                    latest_report = None
+                    report_files = glob.glob(os.path.join(args.sqlite_dir, "validation_batch_report_*.md"))
+                    if report_files:
+                        latest_report = max(report_files, key=os.path.getmtime)
+                    
+                    # Rapport global
+                    overall_report = os.path.join(args.sqlite_dir, "overall_report.md")
+                    has_overall_report = os.path.exists(overall_report)
+                    
+                    # Afficher les rapports si Rich est disponible
+                    if RICH_AVAILABLE and not args.quiet:
+                        try:
+                            from rich.console import Console
+                            from rich.markdown import Markdown
+                            
+                            console = Console()
+                            
+                            # Afficher directement le rapport global s'il existe
+                            if has_overall_report:
+                                print(f"\nRapport global d'état:")
+                                with open(overall_report, 'r', encoding='utf-8') as f:
+                                    md = Markdown(f.read())
+                                console.print(md)
+                                print(f"\nRapport global sauvegardé dans: {overall_report}")
+                            
+                            # Pour le rapport détaillé, indiquer simplement son emplacement
+                            if latest_report:
+                                print(f"\nRapport détaillé disponible: {latest_report}")
+                                
+                        except Exception as e:
+                            logger.debug(f"Erreur lors de l'affichage des rapports: {str(e)}")
+                    
+                    # Afficher simplement les chemins des rapports si on est en mode silencieux ou sans Rich
+                    elif latest_report or has_overall_report:
+                        if has_overall_report:
+                            print(f"\nRapport global disponible: {overall_report}")
+                        if latest_report:
+                            print(f"Rapport détaillé disponible: {latest_report}")
+                else:
+                    print_error_message("Aucune base n'a été validée avec succès")
+                    sys.exit(1)
+                
+                sys.exit(0)
+            
+            if not args.sqlite_db:
+                print_error_message("Base de données SQLite source non spécifiée")
+                logger.error("Utilisez --sqlite_db pour spécifier la base SQLite source à comparer")
+                sys.exit(1)
+            
+            if args.use_admin_user:
+                target_username = ORACLE_CONFIG["user"]
+                target_password = ORACLE_CONFIG["password"]
+            else:
+                target_username, target_password = determine_oracle_username(args.sqlite_db, args)
+            
+            user_config = {
+                "user": target_username,
+                "password": target_password,
+                "dsn": ORACLE_CONFIG["dsn"]
+            }
+            
+            success = validate_schema_with_output(
+                args.sqlite_db,
+                user_config,
+                verbose=args.verbose
+            )
+            
+            sys.exit(0 if success else 1)
         
-        # Étape 2: Vérifier la présence de la base de données SQLite
         if not args.sqlite_db:
             print_error_message("Aucune base de données SQLite spécifiée")
             logger.error("Utilisez --sqlite_db ou la variable d'environnement ORACLE_SQLITE_DB")
+            logger.info("Ou activez le mode batch avec --batch et spécifiez un répertoire avec --sqlite-dir")
             sys.exit(1)
         
-        logger.info("Démarrage de la conversion SQLite vers Oracle...")
-        
-        logger.info(f"Configuration Oracle Admin: [bold cyan]user={ORACLE_CONFIG['user']}, dsn={ORACLE_CONFIG['dsn']}[/bold cyan]")
-        logger.info(f"Utilisateur cible: [bold cyan]{target_username}[/bold cyan]")
-        
-        # Étape 3: Déterminer le fichier de sortie
         sqlite_db_path = args.sqlite_db
-        base_name = os.path.splitext(sqlite_db_path)[0]
-        output_file = args.output_file if args.output_file else f"{base_name}_oracle.sql"
+        logger.info("Démarrage de la conversion SQLite vers Oracle...")
+        logger.info(f"Configuration Oracle Admin: [bold cyan]user={ORACLE_CONFIG['user']}, dsn={ORACLE_CONFIG['dsn']}[/bold cyan]")
         
-        # Utiliser une barre de progression pour les tâches longues
-        progress = log_manager.start_progress_mode(show_all_logs=args.verbose)
+        user_config = process_single_database(sqlite_db_path, args, log_manager)
         
-        try:
-            if progress:
-                # Créer une seule liste de tâches pour toutes les étapes
-                tasks = []
-                for step in ["Validation des connexions Oracle",
-                            "Extraction des données SQLite",
-                            "Conversion du schéma vers Oracle",
-                            "Préparation de l'utilisateur Oracle",
-                            "Sauvegarde du script SQL",
-                            "Création/Vérification de l'utilisateur",
-                            "Exécution du script SQL"]:
-                    tasks.append(progress.add_task(f"[bold blue]{step}...", total=1, visible=False))
-                
-                with progress:
-                    # Étape 1: Validation des connexions (afficher uniquement cette tâche)
-                    log_manager.update_task(tasks[0], visible=True)
-                    
-                    # Validation de l'administrateur
-                    admin_success, admin_message = check_oracle_connection(ORACLE_CONFIG)
-                    if not admin_success:
-                        progress.stop()
-                        print_error_message(f"Problème d'identifiants administrateur Oracle: {admin_message}")
-                        sys.exit(1)
-                    
-                    # Validation de l'utilisateur cible si nécessaire
-                    if not args.use_admin_user:
-                        validation_result, validation_message = validate_credentials(ORACLE_CONFIG, target_username, target_password)
-                        if not validation_result:
-                            progress.stop()
-                            print_error_message(f"Problème avec le nouvel utilisateur: {validation_message}")
-                            sys.exit(1)
-                    
-                    # Marquer cette tâche comme terminée et passer à la suivante
-                    log_manager.update_task(tasks[0], completed=1)
-                    
-                    # Étape 2: Extraction des données SQLite
-                    log_manager.update_task(tasks[1], visible=True)
-                    sqlite_sql = extract_sqlite_content(sqlite_db_path)
-                    log_manager.update_task(tasks[1], completed=1)
-                    
-                    # Étape 3: Conversion SQL
-                    log_manager.update_task(tasks[2], visible=True)
-                    oracle_sql = convert_sqlite_dump(sqlite_sql)
-                    log_manager.update_task(tasks[2], completed=1)
-                    
-                    # Étape 4: Préparation utilisateur si nécessaire
-                    if not args.use_admin_user:
-                        log_manager.update_task(tasks[3], visible=True)
-                        recreate_oracle_user(target_username, target_password, ORACLE_CONFIG, args.force_recreate)
-                        log_manager.update_task(tasks[3], completed=1)
-                    
-                    # Étape 5: Sauvegarde SQL
-                    log_manager.update_task(tasks[4], visible=True)
-                    save_oracle_sql(oracle_sql, output_file)
-                    log_manager.update_task(tasks[4], completed=1)
-                    
-                    # Étape 6: Création/vérification utilisateur si nécessaire
-                    if not args.use_admin_user:
-                        log_manager.update_task(tasks[5], visible=True)
-                        user_created = create_oracle_user(ORACLE_CONFIG, target_username, target_password)
-                        if not user_created:
-                            progress.stop()
-                            print_error_message(f"Impossible de créer ou d'utiliser l'utilisateur Oracle {target_username}")
-                            sys.exit(1)
-                        log_manager.update_task(tasks[5], completed=1)
-                    
-                    # Étape 7: Exécuter le script SQL
-                    user_config = {
-                        "user": target_username,
-                        "password": target_password,
-                        "dsn": ORACLE_CONFIG["dsn"]
-                    }
-                    
-                    log_manager.update_task(tasks[6], visible=True)
-                    try:
-                        execute_sql_file(user_config, output_file, drop_tables=args.drop_tables)
-                    except Exception as e:
-                        progress.stop()
-                        print_error_message(f"Échec de l'exécution du script SQL: {str(e)}")
-                        sys.exit(1)
-                    log_manager.update_task(tasks[6], completed=1)
-                    
-                    # Après le succès de l'importation, valider si demandé
-                    if args.validate_schema:
-                        from .schema_validator import run_validation
-                        run_validation(
-                            sqlite_db_path,
-                            user_config,
-                            verbose=args.verbose
-                        )
-            else:
-                logger.info("Extraction des données SQLite...")
-                sqlite_sql = extract_sqlite_content(sqlite_db_path)
-                
-                logger.info("Conversion du SQL SQLite en SQL Oracle...")
-                oracle_sql = convert_sqlite_dump(sqlite_sql)
-                
-                if not args.use_admin_user:
-                    logger.info("Préparation de l'utilisateur Oracle...")
-                    recreate_oracle_user(target_username, target_password, ORACLE_CONFIG, args.force_recreate)
-                
-                logger.info("Sauvegarde du script SQL Oracle...")
-                save_oracle_sql(oracle_sql, output_file)
-                
-                if not args.use_admin_user:
-                    logger.info(f"Création/Vérification de l'utilisateur Oracle {target_username}...")
-                    user_created = create_oracle_user(ORACLE_CONFIG, target_username, target_password)
-                    
-                    if not user_created:
-                        print_error_message(f"Impossible de créer ou d'utiliser l'utilisateur Oracle {target_username}")
-                        sys.exit(1)
-                
-                user_config = {
-                    "user": target_username,
-                    "password": target_password,
-                    "dsn": ORACLE_CONFIG["dsn"]
-                }
-                
-                logger.info(f"Exécution du script SQL dans Oracle...")
-                try:
-                    execute_sql_file(user_config, output_file, drop_tables=args.drop_tables)
-                    logger.info("Script SQL exécuté avec succès dans Oracle")
-                except Exception as e:
-                    print_error_message(f"Échec de l'exécution du script SQL: {str(e)}")
-                    sys.exit(1)
-                
-                # Après le succès de l'importation, valider si demandé
-                if args.validate_schema:
-                    from .schema_validator import run_validation
-                    run_validation(
-                        sqlite_db_path, 
-                        user_config,
-                        verbose=args.verbose
-                    )
-            
-            log_manager.end_progress_mode()
-            
+        if user_config:
             display_sqlalchemy_info(user_config)
             print_success_message("Conversion terminée avec succès!")
             
-        except Exception as e:
-            if progress:
-                progress.stop()
-            print_error_message(f"Erreur pendant la conversion: {str(e)}")
-            if args.verbose:
-                logger.exception("Détails de l'erreur:")
+            if args.validate_schema:
+                db_name = os.path.splitext(os.path.basename(sqlite_db_path))[0]
+                report_file = f"{db_name}_validation_report.md"
+                report_path = os.path.join(os.path.dirname(sqlite_db_path), report_file)
+                if os.path.exists(report_path):
+                    # Afficher directement le rapport si Rich est disponible
+                    if RICH_AVAILABLE:
+                        try:
+                            from rich.console import Console
+                            from rich.markdown import Markdown
+                            
+                            console = Console()
+                            print(f"\nRapport de validation:")
+                            with open(report_path, 'r', encoding='utf-8') as f:
+                                md = Markdown(f.read())
+                            console.print(md)
+                            print(f"\nRapport sauvegardé dans: {report_path}")
+                        except:
+                            print(f"\nRapport de validation disponible: {report_path}")
+                    else:
+                        print(f"\nRapport de validation disponible: {report_path}")
+        else:
+            print_error_message("La conversion a échoué")
             sys.exit(1)
-            
+        
     except Exception as e:
         print_error_message(f"Erreur: {str(e)}")
         if args.verbose:

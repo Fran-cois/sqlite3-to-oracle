@@ -1,6 +1,16 @@
 # SQLite to Oracle Converter
 
-Outil de conversion de bases de données SQLite vers Oracle SQL.
+Outil pour convertir des bases de données SQLite vers Oracle SQL.
+
+## Caractéristiques
+
+- Conversion automatique des types de données SQLite vers Oracle
+- Gestion des tables volumineuses et des types complexes
+- Création automatique d'utilisateur Oracle
+- Plusieurs modes d'importation :
+  - Importation complète (schéma + données)
+  - Schéma uniquement (`--schema-only`)
+  - Structure relationnelle uniquement (`--only-fk-keys`) - conserve uniquement les clés primaires et étrangères
 
 ## Installation
 
@@ -8,7 +18,25 @@ Outil de conversion de bases de données SQLite vers Oracle SQL.
 pip install sqlite3-to-oracle
 ```
 
-## Utilisation
+## Usage
+
+```bash
+# Conversion standard
+sqlite3-to-oracle --sqlite_db ma_base.sqlite
+
+# Conversion avec schéma seulement (sans données)
+sqlite3-to-oracle --sqlite_db ma_base.sqlite --schema-only
+
+# Conversion du squelette relationnel uniquement (uniquement les clés primaires et étrangères)
+sqlite3-to-oracle --sqlite_db ma_base.sqlite --only-fk-keys
+
+# Conversion avec nom d'utilisateur et mot de passe personnalisés
+sqlite3-to-oracle --sqlite_db ma_base.sqlite --new-username mon_user --new-password mon_pass
+```
+
+# Options
+
+### Options de source
 
 ```bash
 # Utilisation en ligne de commande
@@ -97,3 +125,39 @@ La validation post-importation vérifie :
 - ⚠️ **VALIDATION AVEC AVERTISSEMENTS** : L'importation est partiellement réussie mais présente des problèmes
   
 Utilisez l'option `--verbose` pour voir les détails spécifiques des avertissements et des erreurs, comme les tables ou colonnes manquantes.
+
+## Traitement par lots
+
+L'outil permet également de traiter plusieurs bases de données SQLite en une seule fois :
+
+```bash
+# Traiter tous les fichiers .sqlite dans un répertoire
+sqlite3-to-oracle --batch --sqlite-dir /chemin/vers/repertoire --uri-output-file uris.txt
+
+# Traiter des fichiers spécifiques avec un motif
+sqlite3-to-oracle --batch --sqlite-dir /chemin/vers/repertoire --file-pattern "data_*.db" --uri-output-file uris.txt
+```
+
+Les URIs SQLAlchemy de toutes les bases importées avec succès seront enregistrées dans le fichier spécifié.
+
+### Utilisateurs par base de données
+
+En mode batch, chaque base de données SQLite est importée avec son propre utilisateur Oracle dédié. Le nom d'utilisateur et le mot de passe sont dérivés automatiquement du nom du fichier SQLite:
+
+- Pour un fichier `clients.sqlite` → utilisateur Oracle `clients`
+- Pour un fichier `sales_2023.db` → utilisateur Oracle `sales2023`
+
+Cela permet une isolation complète des données entre les différentes bases importées.
+
+> **Note:** Pour utiliser un seul utilisateur administrateur pour toutes les importations, ajoutez l'option `--use-admin-user`.
+
+### Options de traitement par lots
+
+| Option | Description |
+|--------|-------------|
+| `--batch` | Activer le mode de traitement par lots |
+| `--sqlite-dir` | Répertoire contenant les fichiers SQLite à importer |
+| `--file-pattern` | Motif de fichiers à traiter (par défaut: *.sqlite) |
+| `--uri-output-file` | Fichier pour enregistrer les URIs SQLAlchemy |
+| `--continue-on-error` | Continuer le traitement même en cas d'erreur |
+| `--use-admin-user` | Utiliser un seul utilisateur (admin) pour toutes les bases |
