@@ -6,8 +6,8 @@ on:
       - 'v*'  # Déclencher sur les tags qui commencent par 'v'
 
 jobs:
-  build-and-publish:
-    name: Build and Publish Python Package
+  build:
+    name: Build Python Package
     runs-on: ubuntu-latest
     
     steps:
@@ -27,9 +27,28 @@ jobs:
     - name: Build package
       run: |
         python -m build
-        
-    - name: Publish package to PyPI
-      uses: pypa/gh-action-pypi-publish@release/v1
+    
+    - name: Store distribution packages
+      uses: actions/upload-artifact@v3
       with:
-        user: __token__
-        password: ${{ secrets.PYPI_API_TOKEN }}
+        name: python-package-distributions
+        path: dist/
+  
+  pypi-publish:
+    name: upload release to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # Specifying a GitHub environment is optional, but strongly encouraged
+    environment: pypi
+    permissions:
+      # IMPORTANT: this permission is mandatory for Trusted Publishing
+      id-token: write
+    steps:
+      - name: Download distribution packages
+        uses: actions/download-artifact@v3
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
