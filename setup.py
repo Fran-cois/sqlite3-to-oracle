@@ -1,30 +1,30 @@
 """
-Script d'installation pour le package sqlite3-to-oracle.
+Installation script for the sqlite3-to-oracle package.
 """
 
 from setuptools import setup, find_packages
 import os
 
-# Lire le contenu du README
+# Read the README content
 here = os.path.abspath(os.path.dirname(__file__))
 try:
     with open(os.path.join(here, 'README.md'), encoding='utf-8') as f:
         long_description = f.read()
 except FileNotFoundError:
-    long_description = "Outil de conversion de bases de données SQLite vers Oracle"
+    long_description = "SQLite to Oracle database conversion tool"
 
-# Version du package
+# Package version
 version = '1.0.0'
 
 setup(
     name="sqlite3-to-oracle",
     version=version,
-    description="Outil de conversion de bases de données SQLite vers Oracle",
+    description="SQLite to Oracle database conversion tool",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    author="MATILDA Team",
-    author_email="info@matilda.com",
-    url="https://github.com/matilda-team/sqlite3-to-oracle",
+    author="famat.me",
+    author_email="contact@famat.me",
+    url="https://github.com/fran-cois/sqlite3-to-oracle",
     packages=find_packages(),
     install_requires=[
         "oracledb>=1.0.0",
